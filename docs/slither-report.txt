@@ -1,0 +1,42 @@
+'forge clean' running (wd: /workspace/pm-builds/limitdesk)
+'forge config --json' running
+'forge build --build-info --deny never src' running (wd: /workspace/pm-builds/limitdesk)
+INFO:Detectors:
+Detector: unused-return
+LimitDesk._usd(address) (src/LimitDesk.sol#392-402) ignores return value by (roundId,answer,None,updatedAt,answeredInRound) = AggregatorV3Interface(feed).latestRoundData() (src/LimitDesk.sol#395-396)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#unused-return
+INFO:Detectors:
+Detector: timestamp
+LimitDesk.grantAgent(address,uint64) (src/LimitDesk.sol#162-169) uses timestamp for comparisons
+	Dangerous comparisons:
+	- expiry <= block.timestamp (src/LimitDesk.sol#164)
+LimitDesk.post(LimitDesk.Order,bytes) (src/LimitDesk.sol#209-244) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp >= a.expiry (src/LimitDesk.sol#212)
+	- order.expiry <= block.timestamp (src/LimitDesk.sol#214)
+LimitDesk.fill(bytes32) (src/LimitDesk.sol#251-276) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp >= o.expiry (src/LimitDesk.sol#255)
+	- block.timestamp >= a.expiry (src/LimitDesk.sol#259)
+LimitDesk.quoteFill(bytes32) (src/LimitDesk.sol#341-357) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp >= o.expiry (src/LimitDesk.sol#349)
+	- ! a.active || a.epoch != o.epoch || block.timestamp >= a.expiry (src/LimitDesk.sol#351)
+LimitDesk._usd(address) (src/LimitDesk.sol#392-402) uses timestamp for comparisons
+	Dangerous comparisons:
+	- block.timestamp > updatedAt && block.timestamp - updatedAt > heartbeat (src/LimitDesk.sol#398)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#block-timestamp
+INFO:Detectors:
+Detector: cyclomatic-complexity
+LimitDesk.post(LimitDesk.Order,bytes) (src/LimitDesk.sol#209-244) has a high cyclomatic complexity (13).
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#cyclomatic-complexity
+INFO:Detectors:
+Detector: low-level-calls
+Low level call in MockWETH.withdraw(uint256) (src/MockWETH.sol#14-18):
+	- (ok,None) = msg.sender.call{value: amount}() (src/MockWETH.sol#16)
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#low-level-calls
+INFO:Detectors:
+Detector: immutable-states
+MockAggregator.decimals (src/MockAggregator.sol#6) should be immutable 
+Reference: https://github.com/crytic/slither/wiki/Detector-Documentation#state-variables-that-could-be-declared-immutable
+INFO:Slither:src analyzed (35 contracts with 102 detectors), 9 result(s) found
