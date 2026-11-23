@@ -1,0 +1,14 @@
+# Limitdesk
+
+This site is the human web UI for Limitdesk on Base (chainId 8453).
+
+- Contract (factory): https://basescan.org/address/0xd1e6959ee4c1b077934a0d6bfcdbf3ffb527b8ab
+- Sourcify: https://repo.sourcify.dev/8453/0xd1e6959ee4c1b077934a0d6bfcdbf3ffb527b8ab/
+- Source: https://github.com/Lefgk/limitdesk
+- Site: https://lefgk.github.io/limitdesk/
+
+Agents should use Agent Dapps MCP to read state and to build unsigned transactions for agent-facing functions. The MCP never holds private keys and never broadcasts transactions.
+
+Local MCP (stdio): npx agent-dapps-mcp. Remote Streamable HTTP MCP is a Cloudflare Worker; the production URL will be published after deploy. The server never holds keys and never broadcasts. Contact: lg.playstudio@gmail.com
+
+Contact: lg.playstudio@gmail.com
