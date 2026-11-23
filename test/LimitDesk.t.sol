@@ -124,7 +124,8 @@ contract LimitDeskTest is Test {
         desk.fill(id);
 
         assertEq(weth.balanceOf(filler), fillerWeth0 + 1 ether);
-        assertEq(usdc.balanceOf(address(desk)), deskUsdc0 + 2900e6);
+        // audit H-01: fill at max(limit, oracle - 1%) = 2970
+        assertEq(usdc.balanceOf(address(desk)), deskUsdc0 + 2970e6);
         assertEq(desk.available(address(weth)), 9 ether);
         assertEq(desk.totalLocked(address(weth)), 0);
         assertEq(uint256(desk.getOrder(id).status), uint256(LimitDesk.Status.Filled));
@@ -192,8 +193,8 @@ contract LimitDeskTest is Test {
         bytes32 id = _post(o);
         vm.prank(filler);
         desk.fill(id);
-        // fill at the signed limit, not the oracle
-        assertEq(usdc.balanceOf(address(desk)), 50_000e6 + 2400e6);
+        // audit H-01: fill at max(limit 2400, oracle 2450 - 1%) = 2425.5
+        assertEq(usdc.balanceOf(address(desk)), 50_000e6 + 2425.5e6);
     }
 
     function test_stopLimitRejectedWhenOracleBelowLimit() public {
@@ -441,7 +442,7 @@ contract LimitDeskTest is Test {
         assertEq(weth.balanceOf(address(desk)), desk.available(address(weth)) + desk.totalLocked(address(weth)));
         vm.prank(filler);
         desk.fill(id);
-        uint256 paid = amtWei * 2900e6 / 1e18;
+        uint256 paid = amtWei * 2970e6 / 1e18; // audit H-01 bounded fill price
         assertEq(weth.balanceOf(address(desk)), weth0 - amtWei);
         assertEq(usdc.balanceOf(address(desk)), usdc0 + paid);
         assertEq(weth.balanceOf(address(desk)), desk.available(address(weth)) + desk.totalLocked(address(weth)));

@@ -24,8 +24,8 @@ See [SPEC.md](SPEC.md) for the problem, competitors and choices, and [DEPLOY.md]
 
 ## Contract model
 - `grantAgent(agent, expiry)` and `setCap(agent, token, maxOpenSell)` are owner only. Only WETH and USDC are supported.
-- `post(order, signature)` verifies the EIP-712 signature (EOA or ERC-1271), checks caps and escrow, locks `amountSell` and lists the order. Anyone may post.
-- `fill(orderId)` is the only fill path (full fill). A limit fills if the Chainlink price is at or better than `limitPriceX18`, at the signed limit. A stop fills if the price is at or below `stopTriggerX18`; with a limit it also has to stay at or above that limit, otherwise it fills at the oracle. The filler pays `tokenBuy` and receives `tokenSell`; proceeds stay in the desk.
+- `post(order, signature)` verifies the EIP-712 signature (EOA or ERC-1271), checks caps (open + filled in the last 24h) and escrow, locks `amountSell` and lists the order. Anyone may post.
+- `fill(orderId)` is the only fill path (full fill). A limit fills if the Chainlink price is at or better than `limitPriceX18`, at max(limit, oracle × (1 − `fillDiscountBps`)); the discount defaults to 1% and the owner can set 0–10%. A stop fills if the price is at or below `stopTriggerX18`; with a limit it also has to stay at or above that limit and the same bounded price applies, otherwise it fills at the oracle. Each agent cap covers open plus filled sell volume per token over a rolling 24h window. On Base, fills refuse prices while the Chainlink sequencer feed reports downtime or within 1h of a restart. The filler pays `tokenBuy` and receives `tokenSell`; proceeds stay in the desk.
 - `cancel(orderId)` is owner or the agent. `revokeAgent(agent)` cancels that agent's open orders and bumps its epoch, so old signatures cannot be posted.
 - `pause()` blocks post and fill. `withdraw()` is owner only and works while paused (unlocked balance only).
 - Ownership uses `Ownable2Step`, so a Safe can be the owner.

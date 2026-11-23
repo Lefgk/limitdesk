@@ -70,11 +70,24 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     uint256 public constant MAX_OPEN_PER_AGENT = 32;
     uint256 public constant ETH_HEARTBEAT = 2 hours;
     uint256 public constant STABLE_HEARTBEAT = 25 hours;
+    /// @notice Rolling window for the per-agent cap: open + filled sell volume per token per day.
+    uint256 public constant CAP_WINDOW = 1 days;
+    /// @notice Owner can allow fillers at most this discount to the oracle (10%).
+    uint16 public constant MAX_FILL_DISCOUNT_BPS = 1_000;
+    uint16 public constant BPS = 10_000;
+    /// @notice Chainlink L2 sequencer uptime feed on Base; set only when deployed on chain 8453.
+    address public constant BASE_SEQUENCER_FEED = 0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
+    uint256 public constant SEQUENCER_GRACE = 1 hours;
 
     address public immutable weth;
     address public immutable usdc;
     address public immutable ethUsdFeed;
     address public immutable usdcUsdFeed;
+    /// @notice address(0) on chains without a sequencer (Ethereum, anvil).
+    address public immutable sequencerFeed;
+
+    /// @notice Fills never price below oracle * (1 - fillDiscountBps). Default 1%.
+    uint16 public fillDiscountBps = 100;
 
     mapping(address agent => Agent) public agents;
     /// @dev sell-token cap for the current epoch; agent cannot have more than this locked
@@ -89,12 +102,16 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     mapping(address agent => bytes32[]) internal _openByAgent;
     mapping(bytes32 orderId => uint256) internal _openByAgentPos; // 1-based
     mapping(address token => uint256) public totalLocked;
+    /// @dev sell volume filled in the current cap window for (agent, epoch, token)
+    mapping(bytes32 key => uint256) internal _filledInWindow;
+    mapping(bytes32 key => uint64) internal _windowStart;
 
     event Deposited(address indexed from, address indexed token, uint256 amount);
     event Withdrawn(address indexed to, address indexed token, uint256 amount);
     event AgentGranted(address indexed agent, uint64 expiry, uint32 epoch);
     event AgentRevoked(address indexed agent, address indexed by, uint32 newEpoch);
     event CapSet(address indexed agent, address indexed token, uint256 maxOpenSell);
+    event FillDiscountSet(uint16 bps);
     event NonceInvalidated(address indexed agent, uint256 nonce);
     event OrderPosted(bytes32 indexed orderId, address indexed agent, address tokenSell, address tokenBuy, uint256 amountSell);
     event OrderCancelled(bytes32 indexed orderId, address indexed by);
@@ -122,6 +139,9 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     error ZeroAmount();
     error NotOwnerOrAgent();
     error AlreadyUsed();
+    error InvalidDiscount();
+    error SequencerDown();
+    error SequencerGracePeriod();
 
     constructor(address initialOwner, address weth_, address usdc_, address ethUsdFeed_, address usdcUsdFeed_)
         Ownable(initialOwner)
@@ -134,6 +154,7 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
         usdc = usdc_;
         ethUsdFeed = ethUsdFeed_;
         usdcUsdFeed = usdcUsdFeed_;
+        sequencerFeed = block.chainid == 8453 ? BASE_SEQUENCER_FEED : address(0);
     }
 
     // ------------------------------------------------------------------ funding
@@ -166,6 +187,13 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
         a.active = true;
         a.expiry = expiry;
         emit AgentGranted(agent, expiry, a.epoch);
+    }
+
+    /// @notice Max discount to the Chainlink price a filler may receive (bounds filler surplus).
+    function setFillDiscountBps(uint16 bps) external onlyOwner {
+        if (bps > MAX_FILL_DISCOUNT_BPS) revert InvalidDiscount();
+        fillDiscountBps = bps;
+        emit FillDiscountSet(bps);
     }
 
     function setCap(address agent, address token, uint256 maxOpenSell) external onlyOwner {
@@ -223,17 +251,19 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
         if (!SignatureChecker.isValidSignatureNow(order.agent, orderId, signature)) revert InvalidSignature();
         if (_orders[orderId].status != Status.None) revert AlreadyUsed();
 
-        uint256 cap = _caps[_key(order.agent, a.epoch, order.tokenSell)];
+        bytes32 ck = _key(order.agent, a.epoch, order.tokenSell);
+        uint256 cap = _caps[ck];
         if (cap == 0) revert NoCap();
-        uint256 would = _openSell[_key(order.agent, a.epoch, order.tokenSell)] + order.amountSell;
-        if (would > cap) revert CapExceeded(would, cap);
+        uint256 would = _openSell[ck] + order.amountSell;
+        uint256 used = would + _rollWindow(ck);
+        if (used > cap) revert CapExceeded(used, cap);
 
         uint256 avail = available(order.tokenSell);
         if (order.amountSell > avail) revert InsufficientEscrow(avail, order.amountSell);
         if (_openByAgent[order.agent].length >= MAX_OPEN_PER_AGENT) revert TooManyOpenOrders();
 
         _nonceUsed[nkey] = true;
-        _openSell[_key(order.agent, a.epoch, order.tokenSell)] = would;
+        _openSell[ck] = would;
         totalLocked[order.tokenSell] += order.amountSell;
 
         _orders[orderId] = PostedOrder({order: order, status: Status.Open});
@@ -244,10 +274,11 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     }
 
     /// @notice Single fill path: full fill only. Filler pays tokenBuy and receives tokenSell.
-    ///         Limit orders fill at the signed limit if the oracle price is at or better.
-    ///         Stop orders fill once the oracle is at or below the trigger; if a limit is
-    ///         also set, the oracle must stay at or above it and the fill is at that limit,
-    ///         otherwise the fill is at the oracle price.
+    ///         Limit orders fill if the oracle price is at or better than the signed limit, at
+    ///         max(limit, oracle * (1 - fillDiscountBps)). Stop orders fill once the oracle is at
+    ///         or below the trigger; with a limit the oracle must stay at or above it and the
+    ///         same bounded price applies, otherwise the fill is at the oracle price.
+    ///         Filled volume counts against the agent's cap for CAP_WINDOW.
     function fill(bytes32 orderId) external whenNotPaused nonReentrant {
         PostedOrder storage po = _orders[orderId];
         if (po.status != Status.Open) revert OrderNotOpen();
@@ -266,6 +297,8 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
 
         po.status = Status.Filled;
         _unlock(o);
+        bytes32 fk = _key(o.agent, o.epoch, o.tokenSell);
+        _filledInWindow[fk] = _rollWindow(fk) + o.amountSell;
         _popOpen(_openIds, _openPos, orderId);
         _popOpen(_openByAgent[o.agent], _openByAgentPos, orderId);
 
@@ -292,6 +325,13 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
         uint256 bal = IERC20(token).balanceOf(address(this));
         uint256 locked_ = totalLocked[token];
         return bal > locked_ ? bal - locked_ : 0;
+    }
+
+    /// @notice Sell volume already filled in the current cap window (counts against the cap).
+    function filledInWindowOf(address agent, address token) external view returns (uint256) {
+        bytes32 k = _key(agent, agents[agent].epoch, token);
+        if (block.timestamp >= uint256(_windowStart[k]) + CAP_WINDOW) return 0;
+        return _filledInWindow[k];
     }
 
     function capOf(address agent, address token) external view returns (uint256) {
@@ -329,6 +369,7 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
     /// @notice tokenBuy native units per 1e18 tokenSell, from the Chainlink USD feeds.
     function oraclePriceX18(address tokenSell, address tokenBuy) public view returns (uint256) {
         _validPair(tokenSell, tokenBuy);
+        _checkSequencer();
         (uint256 sellUsd, uint8 sellTokDec, uint8 sellFeedDec) = _usd(tokenSell);
         (uint256 buyUsd, uint8 buyTokDec, uint8 buyFeedDec) = _usd(tokenBuy);
         // Multiply first so early division cannot drop precision (USDC 6dp vs WETH 18dp).
@@ -351,22 +392,50 @@ contract LimitDesk is Ownable2Step, Pausable, ReentrancyGuard, EIP712 {
         if (!a.active || a.epoch != o.epoch || block.timestamp >= a.expiry) return (false, 0, 0, 0);
         oraclePx = oraclePriceX18(o.tokenSell, o.tokenBuy);
         if (!_conditionMet(o, oraclePx)) return (false, 0, 0, oraclePx);
-        fillPrice = o.orderType == OrderType.Limit || o.limitPriceX18 > 0 ? o.limitPriceX18 : oraclePx;
+        fillPrice = _boundedPrice(o, oraclePx);
         amountBuy = Math.mulDiv(o.amountSell, fillPrice, 1e18);
         ok = amountBuy > 0;
     }
 
     // ------------------------------------------------------------------ internal
 
-    function _fillPrice(Order memory o, uint256 oraclePx) internal pure returns (uint256 fillPx) {
+    function _fillPrice(Order memory o, uint256 oraclePx) internal view returns (uint256 fillPx) {
         if (!_conditionMet(o, oraclePx)) {
             if (o.orderType == OrderType.Limit || o.limitPriceX18 > 0) {
                 revert LimitNotMet(oraclePx, o.limitPriceX18);
             }
             revert StopNotTriggered(oraclePx, o.stopTriggerX18);
         }
-        if (o.orderType == OrderType.Limit || o.limitPriceX18 > 0) return o.limitPriceX18;
+        return _boundedPrice(o, oraclePx);
+    }
+
+    /// @dev Limit / stop-limit fill at max(limit, oracle * (1 - fillDiscountBps)); market stops at the oracle.
+    ///      Audit 2026-11-23 H-01: an unbounded signed limit let a filler take the whole surplus.
+    function _boundedPrice(Order memory o, uint256 oraclePx) internal view returns (uint256) {
+        if (o.orderType == OrderType.Limit || o.limitPriceX18 > 0) {
+            uint256 floor_ = Math.mulDiv(oraclePx, BPS - fillDiscountBps, BPS);
+            return o.limitPriceX18 > floor_ ? o.limitPriceX18 : floor_;
+        }
         return oraclePx;
+    }
+
+    /// @dev Returns filled volume in the current window, resetting it once the window has elapsed.
+    function _rollWindow(bytes32 k) internal returns (uint256) {
+        if (block.timestamp >= uint256(_windowStart[k]) + CAP_WINDOW) {
+            _windowStart[k] = uint64(block.timestamp);
+            _filledInWindow[k] = 0;
+            return 0;
+        }
+        return _filledInWindow[k];
+    }
+
+    /// @dev Audit 2026-11-23 M-01: refuse prices while the L2 sequencer is down or just restarted.
+    function _checkSequencer() internal view {
+        address f = sequencerFeed;
+        if (f == address(0)) return;
+        (, int256 answer, uint256 startedAt,,) = AggregatorV3Interface(f).latestRoundData();
+        if (answer != 0) revert SequencerDown();
+        if (startedAt == 0 || block.timestamp - startedAt <= SEQUENCER_GRACE) revert SequencerGracePeriod();
     }
 
     function _conditionMet(Order memory o, uint256 oraclePx) internal pure returns (bool) {
