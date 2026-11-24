@@ -1,20 +1,10 @@
 import { useState } from "react";
-import {
-  useAccount,
-  useChainId,
-  useConnect,
-  useDisconnect,
-  usePublicClient,
-  useReadContract,
-  useSignTypedData,
-  useSwitchChain,
-  useWriteContract,
-} from "wagmi";
+import { useAccount, useChainId, useReadContract, useSignTypedData, useWriteContract } from "wagmi";
 import { erc20Abi, formatUnits, isAddress, parseUnits, type Address } from "viem";
 import { limitDeskAbi, limitDeskFactoryAbi } from "./abi";
 import { deployments } from "./config";
+import { Addr, Empty, Hint, Loading, Shell, short, useTx } from "./ui";
 
-const short = (a?: string) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
 
 const ORDER_TYPES = {
   Order: [
@@ -34,63 +24,33 @@ const ORDER_TYPES = {
 export default function App() {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
-  const { connect, connectors } = useConnect();
-  const { disconnect } = useDisconnect();
-  const { switchChain, chains } = useSwitchChain();
   const dep = deployments[chainId] ?? {};
   const [desk, setDesk] = useState<Address | "">("");
 
   return (
-    <div className="wrap">
-      <h1>LimitDesk</h1>
-      <div className="muted">
-        Self-custodial limit and stop orders for AI agents. Owner escrows WETH or USDC; the agent signs EIP-712
-        orders within caps; anyone can fill if the Chainlink price and expiry still hold. Prototype — not audited.
-        Ethereum, Base and local anvil.
-      </div>
-
-      <div className="card">
-        <h2>Wallet</h2>
-        {!isConnected ? (
-          <div className="row">
-            {connectors.map((c) => (
-              <button key={c.uid} onClick={() => connect({ connector: c })}>
-                Connect {c.name}
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="row">
-            <span>
-              Connected <code>{address}</code>
-            </span>
-            <button className="ghost" onClick={() => disconnect()}>
-              Disconnect
-            </button>
-          </div>
-        )}
-        <div className="row">
-          {chains.map((c) => (
-            <button key={c.id} className={c.id === chainId ? "" : "ghost"} onClick={() => switchChain({ chainId: c.id })}>
-              {c.name}
-            </button>
-          ))}
-        </div>
-        {!deployments[chainId] && <div className="warn">Unsupported chain: use Ethereum, Base or local anvil.</div>}
-        {deployments[chainId] && !dep.factory && (
-          <div className="warn">
-            <strong>Not deployed yet</strong> on this chain — the factory address is empty. Core flows stay disabled
-            until you deploy (<code>make deploy-mainnet</code> or <code>make deploy-base</code>), which writes the
-            address into <code>web/src/deployments.json</code>. You can still paste an existing desk address below after
-            connecting.
-          </div>
-        )}
-        {deployments[chainId]?.live && dep.factory && (
-          <div className="warn">
-            Live chain with real funds. This contract is NOT audited — only deposit amounts you can afford to lose.
-          </div>
-        )}
-      </div>
+    <Shell
+      title="LimitDesk"
+      tagline="Limit and stop orders for AI agents, without handing over custody. You escrow WETH or USDC in your own desk contract; your agent can only sign WETH/USDC orders within caps you set; anyone can fill an order, but only if the Chainlink price still satisfies it."
+      steps={[
+        "Create a desk you own and deposit WETH or USDC.",
+        "Grant an agent key with an expiry and a cap per token.",
+        "The agent signs and posts limit or stop orders (the order amount is locked).",
+        "Anyone fills when the oracle price allows. You can pause, revoke or withdraw.",
+      ]}
+      contractLabel="Desk factory"
+      contractOf={(id) => deployments[id]?.factory}
+      refs={[
+        { label: "USDC", address: dep.usdc },
+        { label: "WETH", address: dep.weth },
+      ]}
+      risk={
+        <>
+          <strong>Real funds.</strong> This contract is not audited. Escrowed tokens can be sold by the agent you grant,
+          up to its caps, at prices checked against a Chainlink oracle. Only deposit amounts you can afford to lose.
+        </>
+      }
+    >
+      {!isConnected && <Empty>Connect a wallet to create a desk or manage one you already own.</Empty>}
 
       {isConnected && address && (
         <>
@@ -98,28 +58,8 @@ export default function App() {
           {desk && isAddress(desk) && <DeskPanel desk={desk} usdc={dep.usdc} weth={dep.weth} account={address} />}
         </>
       )}
-    </div>
+    </Shell>
   );
-}
-
-function useTx() {
-  const { writeContractAsync } = useWriteContract();
-  const client = usePublicClient();
-  const [status, setStatus] = useState("");
-  const run = async (label: string, fn: () => Promise<`0x${string}`>) => {
-    try {
-      setStatus(`${label}: confirm in wallet…`);
-      const hash = await fn();
-      setStatus(`${label}: pending ${short(hash)}`);
-      await client!.waitForTransactionReceipt({ hash });
-      setStatus(`${label}: confirmed ✓`);
-      return true;
-    } catch (e) {
-      setStatus(`${label}: ${(e as Error).message.split("\n")[0]}`);
-      return false;
-    }
-  };
-  return { writeContractAsync, status, run };
 }
 
 function DeskPicker(props: {
@@ -129,27 +69,39 @@ function DeskPicker(props: {
   setDesk: (v: Address | "") => void;
 }) {
   const { owner, factory, desk, setDesk } = props;
-  const { data: desks, refetch } = useReadContract({
+  const { data: desks, refetch, isLoading } = useReadContract({
     address: factory,
     abi: limitDeskFactoryAbi,
     functionName: "desksOf",
     args: [owner],
     query: { enabled: !!factory },
   });
-  const { writeContractAsync, status, run } = useTx();
+  const { writeContractAsync, status, run, safe } = useTx();
   return (
     <div className="card">
-      <h2>1. Desk</h2>
-      {!factory && (
-        <div className="warn">
-          <strong>Not deployed yet.</strong> No factory address for this chain. Deploy first (see DEPLOY.md), or set
-          VITE_FACTORY_* in web/.env.
+      <h2>1. Choose a desk</h2>
+      <p className="muted">A desk is your own contract. It holds the escrow and enforces the agent caps.</p>
+      <div className="field-label">Your desks on this network</div>
+      {!factory ? (
+        <Empty>No factory on this network, so desks cannot be listed or created here.</Empty>
+      ) : isLoading ? (
+        <Loading>Looking up your desks…</Loading>
+      ) : desks && desks.length > 0 ? (
+        <div className="row">
+          {desks.map((v) => (
+            <button key={v} className={v === desk ? "seg seg-on" : "seg"} aria-pressed={v === desk} onClick={() => setDesk(v)}>
+              <code>{short(v)}</code>
+              <span className="seg-sub">{v === desk ? "selected" : "select"}</span>
+            </button>
+          ))}
         </div>
+      ) : (
+        <Empty>This wallet has no desks yet. Create one below, or paste the address of a desk you want to inspect.</Empty>
       )}
       <div className="row">
         <button
           disabled={!factory}
-          onClick={async () => {
+          onClick={safe(async () => {
             if (
               await run("Create desk", () =>
                 writeContractAsync({ address: factory!, abi: limitDeskFactoryAbi, functionName: "createDesk" }),
@@ -159,25 +111,21 @@ function DeskPicker(props: {
               const list = r.data ?? [];
               if (list.length) setDesk(list[list.length - 1]);
             }
-          }}
+          })}
         >
           Create new desk
         </button>
         <label>
-          Or use desk address
-          <input value={desk} placeholder="0x…" onChange={(e) => setDesk(e.target.value as Address)} />
+          Or open a desk by address
+          <input value={desk} placeholder="0x…" spellCheck={false} onChange={(e) => setDesk(e.target.value.trim() as Address)} />
         </label>
       </div>
-      {desks && desks.length > 0 && (
-        <div className="row">
-          {desks.map((v) => (
-            <button key={v} className={v === desk ? "" : "ghost"} onClick={() => setDesk(v)}>
-              {short(v)}
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="muted">{status}</div>
+      {desk && !isAddress(desk) && <div className="bad muted">That is not a valid address (0x followed by 40 hex characters).</div>}
+      <Hint>
+        “Create new desk” deploys a desk contract owned by your connected wallet. One transaction, gas only — no funds
+        move.
+      </Hint>
+      {status}
     </div>
   );
 }
@@ -203,7 +151,9 @@ function DeskPanel({
   const { data: onchainWeth } = useReadContract({ address: desk, abi: limitDeskAbi, functionName: "weth" });
   const tokenUsdc = usdc ?? onchainUsdc;
   const tokenWeth = weth ?? onchainWeth;
-  const { writeContractAsync, status, run } = useTx();
+  const { writeContractAsync, status, run, safe } = useTx();
+  const grant = useTx();
+  const isOwner = account.toLowerCase() === owner?.toLowerCase();
 
   const { data: usdcAvail, refetch: refUsdc } = useReadContract({
     address: desk,
@@ -253,11 +203,25 @@ function DeskPanel({
   return (
     <>
       <div className="card">
-        <h2>2. Escrow</h2>
-        <div className="muted">
-          Desk <code>{desk}</code> · owner <code>{short(owner)}</code> ·{" "}
-          {paused ? <span className="bad">PAUSED</span> : <span className="ok">active</span>}
-        </div>
+        <h2>2. Escrow (owner)</h2>
+        <dl className="dl">
+          <dt>Desk</dt>
+          <dd>
+            <Addr value={desk} full />
+          </dd>
+          <dt>Owner</dt>
+          <dd>
+            <Addr value={owner} /> {isOwner && <span className="ok">(you)</span>}
+          </dd>
+          <dt>Orders</dt>
+          <dd>{paused === undefined ? "…" : paused ? <span className="bad">Paused</span> : <span className="ok">Active</span>}</dd>
+        </dl>
+        {owner && !isOwner && (
+          <div className="info">
+            You are not the owner of this desk. You can read it, deposit into it and fill orders, but withdrawing,
+            pausing and agent settings are disabled.
+          </div>
+        )}
         <table>
           <tbody>
             <tr>
@@ -286,15 +250,15 @@ function DeskPanel({
           </label>
           <label>
             Amount
-            <input value={depAmt} onChange={(e) => setDepAmt(e.target.value)} />
+            <input value={depAmt} inputMode="decimal" onChange={(e) => setDepAmt(e.target.value)} />
           </label>
           <button
             disabled={!tokenAddr(depToken)}
-            onClick={async () => {
+            onClick={safe(async () => {
               const token = tokenAddr(depToken)!;
               const amount = parseUnits(depAmt || "0", decimals(depToken));
               if (
-                await run("Approve", () =>
+                await run(`Approve ${depToken.toUpperCase()}`, () =>
                   writeContractAsync({ address: token, abi: erc20Abi, functionName: "approve", args: [desk, amount] }),
                 )
               ) {
@@ -305,14 +269,14 @@ function DeskPanel({
                 )
                   refresh();
               }
-            }}
+            })}
           >
             Approve + deposit
           </button>
           <button
             className="ghost"
-            disabled={!tokenAddr(depToken) || account.toLowerCase() !== owner?.toLowerCase()}
-            onClick={async () => {
+            disabled={!tokenAddr(depToken) || !isOwner}
+            onClick={safe(async () => {
               const token = tokenAddr(depToken)!;
               const amount = parseUnits(depAmt || "0", decimals(depToken));
               if (
@@ -326,16 +290,21 @@ function DeskPanel({
                 )
               )
                 refresh();
-            }}
+            })}
           >
             Withdraw
           </button>
         </div>
+        <Hint>
+          Deposit asks twice: an approval for exactly this amount, then the deposit, which moves the tokens from your
+          wallet into the desk. Withdraw sends available (not locked in an open order) tokens back to your connected
+          wallet.
+        </Hint>
         <div className="row">
           <button
-            className="danger"
-            disabled={account.toLowerCase() !== owner?.toLowerCase()}
-            onClick={async () => {
+            className={paused ? "" : "danger"}
+            disabled={!isOwner}
+            onClick={safe(async () => {
               if (await run(paused ? "Unpause" : "Pause", () =>
                 writeContractAsync({
                   address: desk,
@@ -344,41 +313,53 @@ function DeskPanel({
                 }),
               ))
                 refresh();
-            }}
+            })}
           >
-            {paused ? "Unpause" : "Pause"}
+            {paused ? "Unpause" : "Pause desk"}
           </button>
         </div>
-        <div className="muted">{status}</div>
+        <Hint tone="danger">
+          Pause stops new orders and fills on this desk until you unpause. Your escrow stays in the desk and you can
+          still withdraw.
+        </Hint>
+        {status}
       </div>
 
       <div className="card">
-        <h2>3. Grant agent</h2>
+        <h2>3. Agent key (owner)</h2>
+        <p className="muted">
+          The agent can only sign WETH/USDC orders from this desk. It can never withdraw. Caps limit how much of each
+          token it may have on sale at once.
+        </p>
         <div className="row">
           <label>
             Agent address
-            <input value={agent} placeholder="0x…" onChange={(e) => setAgent(e.target.value)} />
+            <input value={agent} placeholder="0x…" spellCheck={false} onChange={(e) => setAgent(e.target.value.trim())} />
           </label>
           <label>
             Expiry (days)
             <input value={expiryDays} onChange={(e) => setExpiryDays(e.target.value)} />
           </label>
           <label>
-            WETH open-sell cap
+            WETH cap (max on sale)
             <input value={wethCap} onChange={(e) => setWethCap(e.target.value)} />
           </label>
           <label>
-            USDC open-sell cap
+            USDC cap (max on sale)
             <input value={usdcCap} onChange={(e) => setUsdcCap(e.target.value)} />
           </label>
         </div>
         <div className="row">
           <button
-            disabled={!isAddress(agent) || account.toLowerCase() !== owner?.toLowerCase() || !tokenWeth || !tokenUsdc}
-            onClick={async () => {
-              const expiry = BigInt(Math.floor(Date.now() / 1000) + Number(expiryDays) * 86400);
+            disabled={!isAddress(agent) || !isOwner || !tokenWeth || !tokenUsdc}
+            onClick={safe(async () => {
+              const d = Number(expiryDays);
+              if (!Number.isFinite(d) || d <= 0) return grant.fail("Expiry must be a number of days greater than 0.");
+              const expiry = BigInt(Math.floor(Date.now() / 1000 + d * 86400));
+              const capWeth = parseUnits(wethCap || "0", 18);
+              const capUsdc = parseUnits(usdcCap || "0", 6);
               if (
-                await run("Grant agent", () =>
+                await grant.run("Grant agent", () =>
                   writeContractAsync({
                     address: desk,
                     abi: limitDeskAbi,
@@ -387,32 +368,32 @@ function DeskPanel({
                   }),
                 )
               ) {
-                await run("Set WETH cap", () =>
+                await grant.run("Set WETH cap", () =>
                   writeContractAsync({
                     address: desk,
                     abi: limitDeskAbi,
                     functionName: "setCap",
-                    args: [agent as Address, tokenWeth!, parseUnits(wethCap || "0", 18)],
+                    args: [agent as Address, tokenWeth!, capWeth],
                   }),
                 );
-                await run("Set USDC cap", () =>
+                await grant.run("Set USDC cap", () =>
                   writeContractAsync({
                     address: desk,
                     abi: limitDeskAbi,
                     functionName: "setCap",
-                    args: [agent as Address, tokenUsdc!, parseUnits(usdcCap || "0", 6)],
+                    args: [agent as Address, tokenUsdc!, capUsdc],
                   }),
                 );
               }
-            }}
+            })}
           >
             Grant + set caps
           </button>
           <button
             className="danger"
-            disabled={!isAddress(agent) || account.toLowerCase() !== owner?.toLowerCase()}
+            disabled={!isAddress(agent) || !isOwner}
             onClick={() =>
-              run("Revoke agent", () =>
+              grant.run("Revoke agent", () =>
                 writeContractAsync({
                   address: desk,
                   abi: limitDeskAbi,
@@ -425,7 +406,11 @@ function DeskPanel({
             Revoke agent
           </button>
         </div>
-        <div className="muted">{status}</div>
+        <Hint>
+          “Grant + set caps” is three transactions in a row: grant the key until the expiry, then set the WETH cap,
+          then the USDC cap. No funds move. Revoke removes the key at once and invalidates its signed orders.
+        </Hint>
+        {grant.status}
       </div>
 
       {tokenUsdc && tokenWeth && (
@@ -439,7 +424,7 @@ function DeskPanel({
 }
 
 function PostOrder({ desk, account, usdc, weth }: { desk: Address; account: Address; usdc: Address; weth: Address }) {
-  const { writeContractAsync, status, run } = useTx();
+  const { writeContractAsync, status, run, safe, fail } = useTx();
   const { signTypedDataAsync } = useSignTypedData();
   const chainId = useChainId();
   const { data: agentInfo } = useReadContract({
@@ -454,7 +439,7 @@ function PostOrder({ desk, account, usdc, weth }: { desk: Address; account: Addr
   const [limitHuman, setLimitHuman] = useState("3000");
   const [stopHuman, setStopHuman] = useState("2500");
   const [expiryHours, setExpiryHours] = useState("24");
-  const [nonce, setNonce] = useState("1");
+  const [nonce, setNonce] = useState(() => String(Date.now()));
 
   const humanToPrice = (human: string, sellWeth: boolean) => {
     const units = parseUnits(human || "0", 6); // USDC per 1 WETH, 6dp
@@ -464,11 +449,16 @@ function PostOrder({ desk, account, usdc, weth }: { desk: Address; account: Addr
 
   return (
     <div className="card">
-      <h2>4. Sign and post an order</h2>
-      <div className="muted">
-        The connected wallet must be the granted agent. Price is USDC per 1 WETH. A limit sells only at or better than
-        that price; a stop fills if the oracle crosses the trigger.
-      </div>
+      <h2>4. Sign and post an order (agent)</h2>
+      <p className="muted">
+        The connected wallet must be the granted agent. Prices are USDC per 1 WETH. A limit sells only at that price
+        or better; a stop becomes fillable once the oracle crosses the trigger.
+      </p>
+      {agentInfo && !agentInfo[0] && (
+        <div className="info">
+          The connected wallet ({short(account)}) is not an active agent on this desk, so posting will be rejected.
+        </div>
+      )}
       <div className="row">
         <label>
           Pair
@@ -513,7 +503,7 @@ function PostOrder({ desk, account, usdc, weth }: { desk: Address; account: Addr
         </label>
       </div>
       <button
-        onClick={async () => {
+        onClick={safe(async () => {
           const sellWeth = side === "sellWeth";
           const tokenSell = sellWeth ? weth : usdc;
           const tokenBuy = sellWeth ? usdc : weth;
@@ -534,30 +524,34 @@ function PostOrder({ desk, account, usdc, weth }: { desk: Address; account: Addr
             orderType: kind === "limit" ? 0 : 1,
             epoch,
           };
-          try {
-            const signature = await signTypedDataAsync({
-              domain: { name: "LimitDesk", version: "1", chainId, verifyingContract: desk },
-              types: ORDER_TYPES,
-              primaryType: "Order",
-              message: order,
-            });
-            await run("Post order", () =>
-              writeContractAsync({
-                address: desk,
-                abi: limitDeskAbi,
-                functionName: "post",
-                args: [order, signature],
-              }),
-            );
-          } catch (e) {
-            // run() already formats write errors; signing failures land here
-            console.error(e);
-          }
-        }}
+          if (amountSell === 0n) return fail("Amount must be greater than 0.");
+          if (kind !== "stop" && limitPriceX18 === 0n) return fail("Limit price must be greater than 0.");
+          if (kind !== "limit" && stopTriggerX18 === 0n) return fail("Stop trigger must be greater than 0.");
+          // A rejected or failed signature is caught by safe() and shown below; nothing is sent.
+          const signature = await signTypedDataAsync({
+            domain: { name: "LimitDesk", version: "1", chainId, verifyingContract: desk },
+            types: ORDER_TYPES,
+            primaryType: "Order",
+            message: order,
+          });
+          await run("Post order", () =>
+            writeContractAsync({
+              address: desk,
+              abi: limitDeskAbi,
+              functionName: "post",
+              args: [order, signature],
+            }),
+          );
+        })}
       >
         Sign + post
       </button>
-      <div className="muted">{status}</div>
+      <Hint>
+        Two wallet prompts: first a free signature of the order (your wallet shows every field), then a transaction
+        that posts it on the desk and locks the sell amount from the owner's escrow. Once posted, anyone can fill it
+        when the oracle price allows, until it expires or is cancelled.
+      </Hint>
+      {status}
     </div>
   );
 }
@@ -577,7 +571,7 @@ function OrderList({
   weth: Address;
   onChange: () => void;
 }) {
-  const { writeContractAsync, status, run } = useTx();
+  const { writeContractAsync, status, run, safe } = useTx();
   const { data: ids, refetch } = useReadContract({
     address: desk,
     abi: limitDeskAbi,
@@ -593,16 +587,16 @@ function OrderList({
   return (
     <div className="card">
       <h2>5. Open orders</h2>
-      <div className="muted">
-        Oracle (USDC per WETH): {oracleWeth !== undefined ? formatUnits(oracleWeth, 6) : "…"}
-      </div>
-      {!ids?.length && <div className="muted">No open orders.</div>}
+      <p className="muted">
+        Chainlink oracle price: {oracleWeth !== undefined ? `${formatUnits(oracleWeth, 6)} USDC per WETH` : "…"}
+      </p>
+      {ids === undefined ? <Loading /> : ids.length === 0 ? <Empty>No open orders on this desk.</Empty> : null}
       {ids && ids.length > 0 && (
         <table>
           <thead>
             <tr>
-              <th>Id</th>
-              <th></th>
+              <th>Order</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -616,10 +610,12 @@ function OrderList({
                 usdc={usdc}
                 weth={weth}
                 onAct={async (fn, label) => {
-                  if (await run(label, fn)) {
+                  const ok = await run(label, fn);
+                  if (ok) {
                     await refetch();
                     onChange();
                   }
+                  return ok;
                 }}
               />
             ))}
@@ -631,7 +627,12 @@ function OrderList({
           Refresh
         </button>
       </div>
-      <div className="muted">{status}</div>
+      <Hint>
+        Fill is open to anyone: you pay the quoted buy amount from your wallet (approval, then fill) and receive the
+        order's sell amount from the desk. It is rejected unless the oracle price satisfies the order. Cancel is for
+        the desk owner or the order's agent and unlocks the escrow.
+      </Hint>
+      {status}
     </div>
   );
 }
@@ -651,7 +652,7 @@ function OrderRow({
   owner?: Address;
   usdc: Address;
   weth: Address;
-  onAct: (fn: () => Promise<`0x${string}`>, label: string) => void;
+  onAct: (fn: () => Promise<`0x${string}`>, label: string) => Promise<boolean>;
 }) {
   const { writeContractAsync } = useWriteContract();
   const { data } = useReadContract({
@@ -666,7 +667,12 @@ function OrderRow({
     functionName: "quoteFill",
     args: [id],
   });
-  if (!data) return <tr><td colSpan={2}>…</td></tr>;
+  if (!data)
+    return (
+      <tr>
+        <td colSpan={2}>…</td>
+      </tr>
+    );
   const o = data.order;
   const sellWeth = o.tokenSell.toLowerCase() === weth.toLowerCase();
   const amt = formatUnits(o.amountSell, sellWeth ? 18 : 6);
@@ -682,7 +688,14 @@ function OrderRow({
         <div className="muted">
           {o.orderType === 0 ? "Limit" : "Stop"} · sell {amt} {sellWeth ? "WETH" : "USDC"} · limit {humanPx(o.limitPriceX18)}
           {o.stopTriggerX18 > 0n ? ` · stop ${humanPx(o.stopTriggerX18)}` : ""} · agent {short(o.agent)}
-          {quote?.[0] ? <span className="ok"> · fillable</span> : <span> · not fillable</span>}
+          {quote?.[0] ? (
+            <span className="ok">
+              {" "}
+              · fillable now for {formatUnits(quote[1], sellWeth ? 6 : 18)} {sellWeth ? "USDC" : "WETH"}
+            </span>
+          ) : (
+            <span> · not fillable at the current price</span>
+          )}
         </div>
       </td>
       <td>
@@ -691,27 +704,19 @@ function OrderRow({
           onClick={async () => {
             const tokenBuy = sellWeth ? usdc : weth;
             const amountBuy = quote?.[1] ?? 0n;
-            const ok = await (async () => {
-              try {
-                await writeContractAsync({
-                  address: tokenBuy,
-                  abi: erc20Abi,
-                  functionName: "approve",
-                  args: [desk, amountBuy],
-                });
-                return true;
-              } catch {
-                return false;
-              }
-            })();
+            // Wait for the approval to confirm before filling; errors show in the status line.
+            const ok = await onAct(
+              () => writeContractAsync({ address: tokenBuy, abi: erc20Abi, functionName: "approve", args: [desk, amountBuy] }),
+              `Approve ${sellWeth ? "USDC" : "WETH"}`,
+            );
             if (!ok) return;
-            onAct(
+            await onAct(
               () => writeContractAsync({ address: desk, abi: limitDeskAbi, functionName: "fill", args: [id] }),
               "Fill",
             );
           }}
         >
-          Fill
+          Approve + fill
         </button>{" "}
         <button
           className="ghost"
